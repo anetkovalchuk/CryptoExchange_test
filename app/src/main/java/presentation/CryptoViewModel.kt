@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -23,16 +24,22 @@ class CryptoViewModel(
 ) : ViewModel() {
 
     private val syncMetaState = MutableStateFlow(SyncMeta())
+    private val hasObservedCache = MutableStateFlow(false)
 
     val uiState: StateFlow<CryptoUiState> = combine(
-        observeCryptocurrenciesUseCase(),
+        observeCryptocurrenciesUseCase().onEach {
+            hasObservedCache.value = true
+        },
         workManager.getWorkInfosForUniqueWorkFlow(CryptoSyncScheduler.MANUAL_SYNC_WORK_NAME),
-        syncMetaState
-    ) { currencies, workInfos, meta ->
+        syncMetaState,
+        hasObservedCache
+    ) { currencies, workInfos, meta, hasLoadedCache ->
         val latestWork = workInfos.firstOrNull()
         val workState = latestWork?.state?.toSyncUiState() ?: SyncUiState.IDLE
-        val isActive = latestWork?.state == WorkInfo.State.ENQUEUED ||
+
+        val isQueuedOrRunning = latestWork?.state == WorkInfo.State.ENQUEUED ||
                 latestWork?.state == WorkInfo.State.RUNNING
+        val isActuallyRunning = latestWork?.state == WorkInfo.State.RUNNING
 
         val workerOutputMessage = latestWork
             ?.outputData
@@ -48,7 +55,9 @@ class CryptoViewModel(
         val maxUpdatedInDb = currencies.maxOfOrNull { it.updatedAt }
         val resolvedLastUpdated = maxUpdatedInDb ?: meta.lastSuccessfulSyncMillis
 
-        val resolvedLoading = isActive || meta.isStartingManualSync
+        // isLoading = true лише до першого читання з Room або поки воркер реально виконується / стартує.
+        // Статус ENQUEUED (очікування мережі) НЕ тримає вічний спіннер.
+        val resolvedLoading = !hasLoadedCache || isActuallyRunning || meta.isStartingManualSync
 
         CryptoUiState(
             currencies = currencies,
@@ -56,12 +65,12 @@ class CryptoViewModel(
             syncState = workState,
             lastUpdatedAtMillis = resolvedLastUpdated,
             errorMessage = resolvedError,
-            isManualSyncActive = isActive
+            isManualSyncActive = isQueuedOrRunning
         )
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5_000),
-        initialValue = CryptoUiState()
+        initialValue = CryptoUiState(isLoading = true)
     )
 
     init {
@@ -112,7 +121,7 @@ class CryptoViewModel(
     }
 
     fun onRefreshClicked() {
-        if (uiState.value.isManualSyncActive || uiState.value.isLoading) return
+        if (uiState.value.isLoading || uiState.value.syncState == SyncUiState.RUNNING) return
 
         syncMetaState.update {
             it.copy(
